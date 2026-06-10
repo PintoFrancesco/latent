@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <title>Differential Bioluminescence × Vaden Flow Field</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; }
+    body { background: #050810; font-family: -apple-system, sans-serif; color: #ddd; }
+    #canvas-wrap {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 10px;
+      padding-right: 310px;
+    }
+    canvas {
+      display: block;
+      box-shadow: 0 4px 60px rgba(0,0,0,0.9);
+      cursor: crosshair;
+      max-width: 100%;
+      max-height: 100%;
+      width: auto;
+      height: auto;
+    }
+    #pane-wrap {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      z-index: 100;
+      width: 290px;
+      max-height: 95vh;
+      overflow-y: auto;
+    }
+    #hud {
+      position: fixed;
+      bottom: 10px;
+      left: 10px;
+      font-size: 11px;
+      color: #6a8;
+      background: rgba(0,0,0,0.5);
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-family: monospace;
+      pointer-events: none;
+      z-index: 100;
+    }
+    #file-loader { display: none; }
+  </style>
+</head>
+<body>
+<div id="canvas-wrap"></div>
+<div id="pane-wrap"></div>
+<div id="hud">nodes: 0 | fps: 0 | mouse: idle | [SPACE] play/pause</div>
+<input type="file" id="file-loader" accept=".json,application/json">
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tweakpane@3.1.10/dist/tweakpane.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.js"></script>
+<script>
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PARAMETERS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const P = {
+  // Sistema
+  paused:        false,
+  seed:          42,
+  initialNodes:  60,
+  initialRadius: 80,
+  maxNodes:      4000,
+
+  // Crescita
+  maxEdgeLen:    9,
+  minEdgeLen:    2,
+  growthChance:  1.0,
+
+  // Forze
+  springForce:   0.45,
+  repulsionRadius: 14,
+  repulsionForce:  0.55,
+  damping:       0.92,
+
+  // Frattale
+  noiseScale:    0.0035,
+  noiseOctaves:  4,
+  noiseFalloff:  0.55,
+  noiseAmp:      0.85,
+  noiseFreq:     0.0015,
+  fractalJitter: 0.18,
+
+  // Flow Field (Vaden curl noise) — divergence-free, creates vortices
+  flowEnabled:   true,
+  flowScale:     0.001,   // spatial scale — smaller = larger vortex structures
+  flowFreq:      0.0008,  // temporal evolution — 0 = static field
+  flowOctaves:   2,       // fewer octaves = smoother, more coherent flow
+  flowFalloff:   0.5,     // amplitude decay per octave
+  flowStrength:  0.18,    // force magnitude (comparable to fractalJitter 0.18)
+
+  // Bioluminescenza
+  glowColor:     '#7ef9d3',
+  coreColor:     '#ffffff',
+  trailAlpha:    14,
+  fadeAmount:    2,
+  lineWeight:    1.2,
+  glowBlur:      18,
+  coreWeight:    0.4,
+  hueOscillate:  true,
+  hueRange:      15,
+  hueSpeed:      0.01,
+
+  // Mouse
+  mouseMode:     'attract',
+  mouseRadius:   120,
+  mouseForce:    0.9,
+  injectCount:   3,
+
+  // Ambiente
+  bgColor:       '#050810',
+  bgAlpha:       12,
+  showBoundary:  false,
+
+  // Drift correction — centroid-based, preserves form shape
+  driftCorrection: 0.0,
+};
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// GLOBALS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const CW = 1414, CH = 1000;
+let nodes = [];
+let accumBuf;
+let timeT = 0;
+let mouseActive = false;
+let lastMouseX = 0, lastMouseY = 0;
+let fpsSmooth = 60;
+let hiResMode = false;
+
+const MAX_HISTORY = 10000;
+let history = [];
+
+function recordSnapshot() {
+  const arr = new Float32Array(nodes.length * 2);
+  for (let i = 0; i < nodes.length; i++) {
+    arr[i*2]   = nodes[i].x;
+    arr[i*2+1] = nodes[i].y;
+  }
+  const g = currentGlowRGB();
+  history.push({ nodes: arr, gR: Math.round(g.r), gG: Math.round(g.g), gB: Math.round(g.b) });
+  if (history.length > MAX_HISTORY) history.shift();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RNG — mulberry32
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function mkRng(seed) {
+  let s = (seed >>> 0) + 1;
+  return () => {
+    s += 0x6D2B79F5;
+    let z = s;
+    z = Math.imul(z ^ (z >>> 15), z | 1);
+    z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INIT — closed ring in canvas center
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function resetCurve() {
+  const rng = mkRng(P.seed);
+  nodes = [];
+  const cx = CW / 2, cy = CH / 2;
+  for (let i = 0; i < P.initialNodes; i++) {
+    const a = (i / P.initialNodes) * Math.PI * 2;
+    const jitter = (rng() - 0.5) * 4;
+    nodes.push({
+      x: cx + Math.cos(a) * (P.initialRadius + jitter),
+      y: cy + Math.sin(a) * (P.initialRadius + jitter),
+      vx: 0, vy: 0,
+    });
+  }
+  if (accumBuf) accumBuf.clear();
+  timeT = 0;
+  history.length = 0;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FRACTAL NOISE — multi-octave Perlin (modulates repulsion radius)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function fractalNoise(x, y, t) {
+  let sum = 0, amp = 1, freq = 1, norm = 0;
+  for (let o = 0; o < P.noiseOctaves; o++) {
+    sum  += amp * noise(x * freq, y * freq, t * freq);
+    norm += amp;
+    amp  *= P.noiseFalloff;
+    freq *= 2;
+  }
+  return sum / norm; // 0..1
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CURL NOISE — divergence-free flow field (Bridson 2007 approach)
+//
+// 2D curl of a scalar Perlin potential f(x,y,t):
+//   u =  ∂f/∂y  (flow-x)
+//   v = -∂f/∂x  (flow-y)
+// Computed via central differences with eps in noise space.
+// Divergence-free by construction → no sinks/sources → closed vortices.
+// Multi-octave version: accumulates curl contributions per octave.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const CURL_EPS = 0.01; // finite difference step in noise space
+
+function curlNoise(nx, ny, t) {
+  // nx, ny are already in noise space (canvas coords × flowScale)
+  let ux = 0, uy = 0;
+  let amp = 1, freq = 1, norm = 0;
+
+  for (let o = 0; o < P.flowOctaves; o++) {
+    const eps = CURL_EPS * freq; // scale eps with frequency for consistent detail
+    const dfdy = (noise(nx * freq, (ny + eps), t * freq) -
+                  noise(nx * freq, (ny - eps), t * freq)) / (2 * eps);
+    const dfdx = (noise((nx + eps) * freq, ny, t * freq) -
+                  noise((nx - eps) * freq, ny, t * freq)) / (2 * eps);
+    ux += amp * dfdy;   //  ∂f/∂y
+    uy += amp * (-dfdx); // -∂f/∂x
+    norm += amp;
+    amp  *= P.flowFalloff;
+    freq *= 2;
+  }
+
+  ux /= norm;
+  uy /= norm;
+
+  // Normalize to unit length so flowStrength is reliable regardless of gradient magnitude
+  const len = Math.hypot(ux, uy);
+  if (len < 0.0001) return { ux: 0, uy: 0 };
+  return { ux: ux / len, uy: uy / len };
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SPATIAL HASH — uniform grid for O(N·k) neighbor lookup
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function buildGrid(cellSize) {
+  const grid = new Map();
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    const gx = Math.floor(n.x / cellSize);
+    const gy = Math.floor(n.y / cellSize);
+    const key = gx + ',' + gy;
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(i);
+  }
+  return grid;
+}
+
+function neighborsOf(i, grid, cellSize, radius) {
+  const n = nodes[i];
+  const gx = Math.floor(n.x / cellSize);
+  const gy = Math.floor(n.y / cellSize);
+  const out = [];
+  const r2 = radius * radius;
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      const cell = grid.get((gx + dx) + ',' + (gy + dy));
+      if (!cell) continue;
+      for (const j of cell) {
+        if (j === i) continue;
+        const m = nodes[j];
+        const ddx = m.x - n.x, ddy = m.y - n.y;
+        if (ddx * ddx + ddy * ddy < r2) out.push(j);
+      }
+    }
+  }
+  return out;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIMULATION STEP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function step(rng) {
+  rng = rng || Math.random;
+  const N = nodes.length;
+  if (N < 3) return;
+  const BW = accumBuf.width, BH = accumBuf.height;
+  const margin = 10 * (BW / CW);
+
+  // 1) GROW — insert midpoint where edge too long
+  if (nodes.length < P.maxNodes) {
+    const newNodes = [];
+    for (let i = 0; i < N; i++) {
+      const a = nodes[i];
+      const b = nodes[(i + 1) % N];
+      newNodes.push(a);
+      const d = Math.hypot(b.x - a.x, b.y - a.y);
+      if (d > P.maxEdgeLen && rng() < P.growthChance) {
+        newNodes.push({
+          x: (a.x + b.x) * 0.5,
+          y: (a.y + b.y) * 0.5,
+          vx: (a.vx + b.vx) * 0.5,
+          vy: (a.vy + b.vy) * 0.5,
+        });
+      }
+    }
+    nodes = newNodes;
+  }
+
+  // 2) PRUNE — remove nodes too close to predecessor
+  if (nodes.length > 6) {
+    const kept = [nodes[0]];
+    for (let i = 1; i < nodes.length; i++) {
+      const a = kept[kept.length - 1];
+      const b = nodes[i];
+      const d = Math.hypot(b.x - a.x, b.y - a.y);
+      if (d > P.minEdgeLen) kept.push(b);
+    }
+    const first = kept[0], last = kept[kept.length - 1];
+    if (kept.length > 6 && Math.hypot(first.x - last.x, first.y - last.y) < P.minEdgeLen) kept.pop();
+    nodes = kept;
+  }
+
+  const M = nodes.length;
+  const cellSize = Math.max(2, P.repulsionRadius);
+  const grid = buildGrid(cellSize);
+
+  // Pre-compute flow field time coordinate (constant per step, cheaper)
+  const flowT = timeT * P.flowFreq;
+
+  // 3) FORCES
+  for (let i = 0; i < M; i++) {
+    const n = nodes[i];
+    const prev = nodes[(i - 1 + M) % M];
+    const next = nodes[(i + 1) % M];
+
+    // spring attraction
+    const mx = (prev.x + next.x) * 0.5;
+    const my = (prev.y + next.y) * 0.5;
+    let fx = (mx - n.x) * P.springForce;
+    let fy = (my - n.y) * P.springForce;
+
+    // fractal noise modulation of repulsion radius
+    const nv = fractalNoise(n.x * P.noiseScale, n.y * P.noiseScale, timeT * P.noiseFreq);
+    const localRep = P.repulsionRadius * (1 + (nv - 0.5) * 2 * P.noiseAmp);
+
+    // repulsion from non-adjacent neighbors
+    const neighs = neighborsOf(i, grid, cellSize, localRep);
+    for (const j of neighs) {
+      if (j === (i - 1 + M) % M || j === (i + 1) % M) continue;
+      const m = nodes[j];
+      const dx = n.x - m.x, dy = n.y - m.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < 0.0001) continue;
+      const d = Math.sqrt(d2);
+      const force = (1 - d / localRep) * P.repulsionForce;
+      fx += (dx / d) * force;
+      fy += (dy / d) * force;
+    }
+
+    // fractal jitter — tangential perturbation
+    if (P.fractalJitter > 0) {
+      const nv2 = fractalNoise(n.x * P.noiseScale * 1.7, n.y * P.noiseScale * 1.7, timeT * P.noiseFreq + 100);
+      const ang = nv2 * Math.PI * 4;
+      fx += Math.cos(ang) * P.fractalJitter;
+      fy += Math.sin(ang) * P.fractalJitter;
+    }
+
+    // curl noise flow field — divergence-free, creates vortices
+    if (P.flowEnabled && P.flowStrength > 0) {
+      const curl = curlNoise(n.x * P.flowScale, n.y * P.flowScale, flowT);
+      fx += curl.ux * P.flowStrength;
+      fy += curl.uy * P.flowStrength;
+    }
+
+    // mouse interaction
+    if (mouseActive) {
+      const mdx = lastMouseX - n.x;
+      const mdy = lastMouseY - n.y;
+      const md = Math.hypot(mdx, mdy);
+      if (md < P.mouseRadius && md > 0.01) {
+        const falloff = 1 - md / P.mouseRadius;
+        const mf = P.mouseForce * falloff;
+        if (P.mouseMode === 'attract') {
+          fx += (mdx / md) * mf;
+          fy += (mdy / md) * mf;
+        } else if (P.mouseMode === 'repel') {
+          fx -= (mdx / md) * mf;
+          fy -= (mdy / md) * mf;
+        }
+      }
+    }
+
+    n.vx = (n.vx + fx) * P.damping;
+    n.vy = (n.vy + fy) * P.damping;
+  }
+
+  // 4) DRIFT CORRECTION — shift entire curve toward canvas center based on centroid
+  if (P.driftCorrection > 0) {
+    let cx = 0, cy = 0;
+    for (let i = 0; i < M; i++) { cx += nodes[i].x; cy += nodes[i].y; }
+    cx /= M; cy /= M;
+    const corrX = (BW * 0.5 - cx) * P.driftCorrection;
+    const corrY = (BH * 0.5 - cy) * P.driftCorrection;
+    for (let i = 0; i < M; i++) {
+      nodes[i].vx += corrX;
+      nodes[i].vy += corrY;
+    }
+  }
+
+  // 5) INTEGRATE
+  for (let i = 0; i < M; i++) {
+    const n = nodes[i];
+    n.x += n.vx;
+    n.y += n.vy;
+    if (n.x < margin)      { n.x = margin;      n.vx *= -0.5; }
+    if (n.x > BW - margin) { n.x = BW - margin; n.vx *= -0.5; }
+    if (n.y < margin)      { n.y = margin;       n.vy *= -0.5; }
+    if (n.y > BH - margin) { n.y = BH - margin;  n.vy *= -0.5; }
+  }
+
+  timeT += 1;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INJECT
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function injectAt(x, y) {
+  if (nodes.length < 3) return;
+  let bestI = 0, bestD = Infinity;
+  for (let i = 0; i < nodes.length; i++) {
+    const a = nodes[i];
+    const b = nodes[(i + 1) % nodes.length];
+    const mx = (a.x + b.x) * 0.5, my = (a.y + b.y) * 0.5;
+    const d = Math.hypot(mx - x, my - y);
+    if (d < bestD) { bestD = d; bestI = i; }
+  }
+  const inserts = [];
+  for (let k = 0; k < P.injectCount; k++) {
+    inserts.push({
+      x: x + (Math.random() - 0.5) * 6,
+      y: y + (Math.random() - 0.5) * 6,
+      vx: 0, vy: 0,
+    });
+  }
+  nodes.splice(bestI + 1, 0, ...inserts);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HSL HELPERS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function hexToHSL(hex) {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  let h, s, l = (mx + mn) / 2;
+  if (mx === mn) { h = 0; s = 0; }
+  else {
+    const d = mx - mn;
+    s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    switch (mx) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+      case g: h = (b - r) / d + 2; break;
+      default: h = (r - g) / d + 4;
+    }
+    h *= 60;
+  }
+  return { h, s, l };
+}
+function hslToRgb(h, s, l) {
+  h = ((h % 360) + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = l - c / 2;
+  let r, g, b;
+  if (h < 60)       { r = c; g = x; b = 0; }
+  else if (h < 120) { r = x; g = c; b = 0; }
+  else if (h < 180) { r = 0; g = c; b = x; }
+  else if (h < 240) { r = 0; g = x; b = c; }
+  else if (h < 300) { r = x; g = 0; b = c; }
+  else              { r = c; g = 0; b = x; }
+  return { r: (r + m) * 255, g: (g + m) * 255, b: (b + m) * 255 };
+}
+
+function currentGlowRGB() {
+  const hsl = hexToHSL(P.glowColor);
+  if (P.hueOscillate) {
+    hsl.h += Math.sin(timeT * P.hueSpeed) * P.hueRange;
+  }
+  return hslToRgb(hsl.h, hsl.s, hsl.l);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RENDER — accumulative bioluminescent trail
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function renderTrail() {
+  if (P.fadeAmount > 0) {
+    accumBuf.drawingContext.globalCompositeOperation = 'destination-out';
+    accumBuf.noStroke();
+    accumBuf.fill(0, 0, 0, P.fadeAmount);
+    accumBuf.rect(0, 0, accumBuf.width, accumBuf.height);
+    accumBuf.drawingContext.globalCompositeOperation = 'source-over';
+  }
+
+  const gRGB = currentGlowRGB();
+  const glowCSS = 'rgb(' + Math.round(gRGB.r) + ',' + Math.round(gRGB.g) + ',' + Math.round(gRGB.b) + ')';
+
+  accumBuf.drawingContext.shadowBlur  = P.glowBlur;
+  accumBuf.drawingContext.shadowColor = glowCSS;
+  accumBuf.noFill();
+
+  accumBuf.stroke(gRGB.r, gRGB.g, gRGB.b, P.trailAlpha);
+  accumBuf.strokeWeight(P.lineWeight);
+  accumBuf.beginShape();
+  for (const n of nodes) accumBuf.vertex(n.x, n.y);
+  accumBuf.endShape(CLOSE);
+
+  if (P.coreWeight > 0) {
+    accumBuf.drawingContext.shadowBlur = 0;
+    const cc = color(P.coreColor);
+    accumBuf.stroke(red(cc), green(cc), blue(cc), Math.min(255, P.trailAlpha * 1.8));
+    accumBuf.strokeWeight(P.coreWeight);
+    accumBuf.beginShape();
+    for (const n of nodes) accumBuf.vertex(n.x, n.y);
+    accumBuf.endShape(CLOSE);
+  }
+  accumBuf.drawingContext.shadowBlur = 0;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// p5 INSTANCE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function setup() {
+  const c = createCanvas(CW, CH);
+  c.parent('canvas-wrap');
+  pixelDensity(1);
+  accumBuf = createGraphics(CW, CH);
+  accumBuf.pixelDensity(1);
+  noiseDetail(1, 0.5);
+  resetCurve();
+  setupPane();
+
+  c.canvas.addEventListener('mousedown', onMouseDown);
+  c.canvas.addEventListener('mousemove', onMouseMove);
+  c.canvas.addEventListener('mouseup',   onMouseUp);
+  c.canvas.addEventListener('mouseleave',onMouseUp);
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && e.target.tagName !== 'INPUT') {
+      e.preventDefault();
+      P.paused = !P.paused;
+      if (pane) pane.refresh();
+    }
+  });
+
+  document.getElementById('file-loader').addEventListener('change', onPresetFile);
+}
+
+let pane = null;
+
+function onMouseDown(e) {
+  const r = e.target.getBoundingClientRect();
+  lastMouseX = (e.clientX - r.left) * (CW / r.width);
+  lastMouseY = (e.clientY - r.top)  * (CH / r.height);
+  if (P.mouseMode === 'inject') injectAt(lastMouseX, lastMouseY);
+  else mouseActive = true;
+}
+function onMouseMove(e) {
+  const r = e.target.getBoundingClientRect();
+  lastMouseX = (e.clientX - r.left) * (CW / r.width);
+  lastMouseY = (e.clientY - r.top)  * (CH / r.height);
+}
+function onMouseUp() { mouseActive = false; }
+
+function draw() {
+  if (hiResMode) return;
+  if (!P.paused) {
+    step();
+    renderTrail();
+    recordSnapshot();
+  }
+
+  background(red(color(P.bgColor)), green(color(P.bgColor)), blue(color(P.bgColor)), P.bgAlpha);
+  drawingContext.globalCompositeOperation = 'lighter';
+  image(accumBuf, 0, 0);
+  drawingContext.globalCompositeOperation = 'source-over';
+
+  if (mouseActive || P.mouseMode === 'inject') {
+    noFill();
+    stroke(P.mouseMode === 'repel' ? '#ff6080' : (P.mouseMode === 'inject' ? '#ffd060' : '#80ffd0'));
+    strokeWeight(0.5);
+    ellipse(lastMouseX, lastMouseY, P.mouseRadius * 2, P.mouseRadius * 2);
+  }
+
+  fpsSmooth = fpsSmooth * 0.9 + frameRate() * 0.1;
+  const hud = document.getElementById('hud');
+  const flowInfo = P.flowEnabled ? ' | flow: ON' : ' | flow: OFF';
+  hud.textContent = `nodes: ${nodes.length} | fps: ${fpsSmooth.toFixed(0)} | mouse: ${mouseActive ? P.mouseMode : 'idle'} | t: ${timeT} | hist: ${history.length}/${MAX_HISTORY}${flowInfo}`;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EXPORT
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function exportPNG() {
+  saveCanvas('diff-biolumin-vaden-' + Date.now(), 'png');
+}
+
+function createProgressUI() {
+  const overlay = document.createElement('div');
+  overlay.id = 'progress-overlay';
+  overlay.style.cssText = `
+    position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+    z-index: 1000; display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, sans-serif; color: #ddd;
+  `;
+  overlay.innerHTML = `
+    <div style="width: 480px; padding: 30px; background: #0c1420; border: 1px solid #234; border-radius: 8px;">
+      <div id="prog-title" style="font-size: 16px; margin-bottom: 16px; color: #7ef9d3;">Export TIFF A2 600dpi</div>
+      <div id="prog-status" style="font-size: 13px; margin-bottom: 14px; color: #aab;">Preparazione...</div>
+      <div style="width: 100%; height: 14px; background: #1a2535; border-radius: 7px; overflow: hidden;">
+        <div id="prog-bar" style="height: 100%; width: 0%; background: linear-gradient(90deg, #7ef9d3, #4fc7e0); transition: width 0.15s;"></div>
+      </div>
+      <div id="prog-pct" style="font-size: 11px; margin-top: 8px; color: #6a8; font-family: monospace; text-align: right;">0%</div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  return {
+    setStatus: (s) => { document.getElementById('prog-status').textContent = s; },
+    setProgress: (p, s) => {
+      document.getElementById('prog-bar').style.width = (p * 100).toFixed(1) + '%';
+      document.getElementById('prog-pct').textContent = (p * 100).toFixed(1) + '%';
+      if (s) document.getElementById('prog-status').textContent = s;
+    },
+    remove: () => overlay.remove(),
+  };
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function exportTIFF_A2() {
+  if (hiResMode) return;
+
+  const TARGET_W = 14031, TARGET_H = 9921;
+
+  if (history.length === 0) {
+    alert('Nessuna storia registrata.\nLascia girare la simulazione (anche pochi secondi), poi pausa e click TIFF.');
+    return;
+  }
+
+  hiResMode = true;
+  const live = {
+    fadeAmount: P.fadeAmount,
+    lineWeight: P.lineWeight,
+    glowBlur:   P.glowBlur,
+    coreWeight: P.coreWeight,
+  };
+
+  const ui = createProgressUI();
+  ui.setStatus('Allocazione buffer ' + TARGET_W + '×' + TARGET_H + ' (~556 MB)...');
+  console.log('[TIFF] replay start | history=' + history.length + ' step');
+  await sleep(50);
+
+  let hiAccum;
+  try {
+    hiAccum = createGraphics(TARGET_W, TARGET_H);
+    hiAccum.pixelDensity(1);
+  } catch (err) {
+    hiResMode = false;
+    ui.remove();
+    alert('Allocazione canvas A2 fallita: ' + err.message);
+    return;
+  }
+
+  try {
+    const S = TARGET_H / CH;
+    P.lineWeight *= S;
+    P.glowBlur   *= S;
+    P.coreWeight *= S;
+
+    const cc = color(P.coreColor);
+    const coreR = red(cc), coreG = green(cc), coreB = blue(cc);
+    const N = history.length;
+    const ctx = hiAccum.drawingContext;
+    const t0 = performance.now();
+    ui.setProgress(0, 'Replay history: ' + N + ' step su buffer A2...');
+    await sleep(20);
+
+    const CHUNK = 8;
+    for (let s = 0; s < N; s += CHUNK) {
+      const lim = Math.min(s + CHUNK, N);
+      for (let i = s; i < lim; i++) {
+        const snap = history[i];
+        const arr = snap.nodes;
+        const M = arr.length / 2;
+
+        if (P.fadeAmount > 0) {
+          ctx.globalCompositeOperation = 'destination-out';
+          hiAccum.noStroke();
+          hiAccum.fill(0, 0, 0, P.fadeAmount);
+          hiAccum.rect(0, 0, TARGET_W, TARGET_H);
+          ctx.globalCompositeOperation = 'source-over';
+        }
+
+        // Match live accumBuf: source-over (NOT lighter). The live brightness boost
+        // comes from the canvas-level bg_fade + lighter blit, handled analytically below.
+        ctx.shadowBlur  = P.glowBlur;
+        ctx.shadowColor = 'rgb(' + snap.gR + ',' + snap.gG + ',' + snap.gB + ')';
+        hiAccum.noFill();
+        hiAccum.stroke(snap.gR, snap.gG, snap.gB, P.trailAlpha);
+        hiAccum.strokeWeight(P.lineWeight);
+        hiAccum.beginShape();
+        for (let k = 0; k < M; k++) hiAccum.vertex(arr[k*2] * S, arr[k*2+1] * S);
+        hiAccum.endShape(CLOSE);
+
+        if (P.coreWeight > 0) {
+          ctx.shadowBlur = 0;
+          hiAccum.stroke(coreR, coreG, coreB, Math.min(255, P.trailAlpha * 1.8));
+          hiAccum.strokeWeight(P.coreWeight);
+          hiAccum.beginShape();
+          for (let k = 0; k < M; k++) hiAccum.vertex(arr[k*2] * S, arr[k*2+1] * S);
+          hiAccum.endShape(CLOSE);
+        }
+        ctx.shadowBlur = 0;
+      }
+      const pct = lim / N;
+      const elapsed = (performance.now() - t0) / 1000;
+      const eta = elapsed / Math.max(0.001, pct) - elapsed;
+      ui.setProgress(pct * 0.85,
+        'Replay ' + lim + '/' + N + ' | trascorso ' + elapsed.toFixed(1) + 's | ETA ~' + eta.toFixed(0) + 's');
+      if (lim % 200 === 0 || lim === N) {
+        console.log('[TIFF] replay step ' + lim + '/' + N);
+      }
+      await sleep(0);
+    }
+
+    // Compose final pixels with the EXACT live canvas steady-state formula.
+    //
+    // Per-frame live loop:
+    //   c ← c × (1 - bgAlpha/255) + bg × (bgAlpha/255)     (source-over bg fill)
+    //   c ← min(255, c + accumBuf_premul_rgb)              (lighter blit of accumBuf)
+    //
+    // Equilibrium (assuming no clip): c* = bg + accumBuf_premul × (255/bgAlpha)
+    // where accumBuf_premul = unpremul_rgb × stored_alpha / 255 (canvas internal form).
+    //
+    // So: final = min(255, bg + unpremul.rgb × stored_alpha / bgAlpha)
+    //
+    // getImageData returns unpremultiplied RGB + stored alpha — exactly what we need.
+    // No extra "destination-over bg" step: bg is added directly in the per-pixel pass.
+    ui.setProgress(0.9, 'Composizione live steady-state (bg + accumBuf × 255/bgAlpha)...');
+    await sleep(10);
+    const bg = color(P.bgColor);
+    const bgR = red(bg), bgG = green(bg), bgB = blue(bg);
+    const invBgA = P.bgAlpha > 0 ? 1 / P.bgAlpha : 1; // bgAlpha=0 falls back to no-fade (rare)
+    const imgData = ctx.getImageData(0, 0, TARGET_W, TARGET_H);
+    {
+      const d = imgData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const a = d[i+3];
+        const k = a * invBgA;
+        d[i]   = Math.min(255, (bgR + d[i]   * k) | 0);
+        d[i+1] = Math.min(255, (bgG + d[i+1] * k) | 0);
+        d[i+2] = Math.min(255, (bgB + d[i+2] * k) | 0);
+        d[i+3] = 255;
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+
+    ui.setProgress(0.94, 'Lettura pixel hi-res...');
+    await sleep(20);
+
+    ui.setProgress(0.96, 'Encoding TIFF (può durare 20-60s)...');
+    await sleep(20);
+    const rgbaBytes = new Uint8Array(imgData.data.buffer);
+    const tiffBuf = UTIF.encodeImage(rgbaBytes, TARGET_W, TARGET_H);
+    console.log('[TIFF] encoded | size=' + tiffBuf.byteLength + ' bytes');
+
+    ui.setProgress(0.99, 'Download...');
+    await sleep(20);
+    const blob = new Blob([tiffBuf], { type: 'image/tiff' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'diff-biolumin-vaden-A2-' + Date.now() + '.tif';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    ui.setProgress(1, 'Completato.');
+    await sleep(300);
+
+    const totalT = ((performance.now() - t0) / 1000).toFixed(1);
+    alert('TIFF A2 600dpi salvato.\n' +
+          'File: ' + a.download + '\n' +
+          'Step replay: ' + N + '\n' +
+          'Tempo totale: ' + totalT + 's');
+  } catch (err) {
+    alert('Errore durante export TIFF: ' + err.message);
+    console.error(err);
+  } finally {
+    if (hiAccum) hiAccum.remove();
+    P.fadeAmount = live.fadeAmount;
+    P.lineWeight = live.lineWeight;
+    P.glowBlur   = live.glowBlur;
+    P.coreWeight = live.coreWeight;
+    hiResMode = false;
+    ui.remove();
+  }
+}
+
+function exportPreset() {
+  const blob = new Blob([JSON.stringify(P, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'preset-' + Date.now() + '.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function loadPreset() {
+  document.getElementById('file-loader').click();
+}
+
+function onPresetFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    try {
+      const parsed = JSON.parse(ev.target.result);
+      for (const k in parsed) {
+        if (k in P) P[k] = parsed[k];
+      }
+      if (pane) pane.refresh();
+    } catch (err) {
+      alert('JSON non valido: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+  e.target.value = '';
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TWEAKPANE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function setupPane() {
+  pane = new Tweakpane.Pane({ container: document.getElementById('pane-wrap'), title: 'Diff Biolumin × Vaden' });
+
+  const fSys = pane.addFolder({ title: 'Sistema' });
+  fSys.addInput(P, 'paused');
+  fSys.addInput(P, 'seed',          { step: 1 });
+  fSys.addInput(P, 'initialNodes',  { min: 6, max: 200, step: 1 });
+  fSys.addInput(P, 'initialRadius', { min: 10, max: 300, step: 1 });
+  fSys.addInput(P, 'maxNodes',      { min: 100, max: 8000, step: 100 });
+  fSys.addButton({ title: 'Reset curva' }).on('click', resetCurve);
+  fSys.addButton({ title: 'Clear trail' }).on('click', () => { accumBuf.clear(); history.length = 0; });
+
+  const fGrow = pane.addFolder({ title: 'Crescita' });
+  fGrow.addInput(P, 'maxEdgeLen',   { min: 2,  max: 30, step: 0.5 });
+  fGrow.addInput(P, 'minEdgeLen',   { min: 0.5, max: 10, step: 0.5 });
+  fGrow.addInput(P, 'growthChance', { min: 0, max: 1, step: 0.01 });
+
+  const fForce = pane.addFolder({ title: 'Forze' });
+  fForce.addInput(P, 'springForce',      { min: 0, max: 2, step: 0.01 });
+  fForce.addInput(P, 'repulsionRadius',  { min: 2, max: 300, step: 1 });
+  fForce.addInput(P, 'repulsionForce',   { min: 0, max: 2, step: 0.01 });
+  fForce.addInput(P, 'damping',          { min: 0.5, max: 0.99, step: 0.01 });
+  fForce.addInput(P, 'driftCorrection',  { min: 0, max: 0.01, step: 0.0001 });
+
+  const fFrac = pane.addFolder({ title: 'Frattale' });
+  fFrac.addInput(P, 'noiseScale',    { min: 0.0005, max: 0.02, step: 0.0005 });
+  fFrac.addInput(P, 'noiseOctaves',  { min: 1, max: 8, step: 1 });
+  fFrac.addInput(P, 'noiseFalloff',  { min: 0.2, max: 0.9, step: 0.05 });
+  fFrac.addInput(P, 'noiseAmp',      { min: 0, max: 1, step: 0.01 });
+  fFrac.addInput(P, 'noiseFreq',     { min: 0, max: 0.01, step: 0.0001 });
+  fFrac.addInput(P, 'fractalJitter', { min: 0, max: 1, step: 0.01 });
+
+  // ── New folder: curl noise flow field ──────────────────────────────────────
+  const fFlow = pane.addFolder({ title: 'Flow Field (Vaden curl)' });
+  fFlow.addInput(P, 'flowEnabled');
+  fFlow.addInput(P, 'flowStrength',  { min: 0, max: 2, step: 0.01 });
+  fFlow.addInput(P, 'flowScale',     { min: 0.0002, max: 0.01, step: 0.0001 });
+  fFlow.addInput(P, 'flowFreq',      { min: 0, max: 0.005, step: 0.0001 });
+  fFlow.addInput(P, 'flowOctaves',   { min: 1, max: 4, step: 1 });
+  fFlow.addInput(P, 'flowFalloff',   { min: 0.1, max: 0.9, step: 0.05 });
+
+  const fBio = pane.addFolder({ title: 'Bioluminescenza' });
+  fBio.addInput(P, 'glowColor');
+  fBio.addInput(P, 'coreColor');
+  fBio.addInput(P, 'trailAlpha',  { min: 1, max: 80, step: 1 });
+  fBio.addInput(P, 'fadeAmount',  { min: 0, max: 30, step: 0.5 });
+  fBio.addInput(P, 'lineWeight',  { min: 0.2, max: 6, step: 0.1 });
+  fBio.addInput(P, 'glowBlur',    { min: 0, max: 60, step: 1 });
+  fBio.addInput(P, 'coreWeight',  { min: 0, max: 3, step: 0.1 });
+  fBio.addInput(P, 'hueOscillate');
+  fBio.addInput(P, 'hueRange',   { min: 0, max: 90, step: 1 });
+  fBio.addInput(P, 'hueSpeed',   { min: 0, max: 0.1, step: 0.001 });
+
+  const fMouse = pane.addFolder({ title: 'Mouse' });
+  fMouse.addInput(P, 'mouseMode', { options: { attract: 'attract', repel: 'repel', inject: 'inject' } });
+  fMouse.addInput(P, 'mouseRadius', { min: 20, max: 400, step: 1 });
+  fMouse.addInput(P, 'mouseForce',  { min: 0, max: 3, step: 0.01 });
+  fMouse.addInput(P, 'injectCount', { min: 1, max: 20, step: 1 });
+
+  const fEnv = pane.addFolder({ title: 'Ambiente' });
+  fEnv.addInput(P, 'bgColor');
+  fEnv.addInput(P, 'bgAlpha', { min: 0, max: 60, step: 1 });
+
+  const fExp = pane.addFolder({ title: 'Export' });
+  fExp.addButton({ title: 'PNG (canvas)' }).on('click', exportPNG);
+  fExp.addButton({ title: 'TIFF A2 600dpi (14031×9921)' }).on('click', exportTIFF_A2);
+  fExp.addButton({ title: 'Salva preset JSON' }).on('click', exportPreset);
+  fExp.addButton({ title: 'Carica preset JSON' }).on('click', loadPreset);
+}
+</script>
+</body>
+</html>
