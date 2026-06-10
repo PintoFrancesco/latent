@@ -17,5 +17,6 @@ the system passed through as it unfolded. Magenta on black.
 
 *Requires [Processing 4](https://processing.org/download). Open `filamenti.pde` to run.*
 
-[pinto.codes](https://pinto.codes)
+[Video](https://vimeo.com/1200010268) · [pinto.codes](https://pinto.codes)
+
 
